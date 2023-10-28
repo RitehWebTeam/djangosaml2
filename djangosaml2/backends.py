@@ -15,27 +15,17 @@
 
 import logging
 
+from django.apps import apps
 from django.conf import settings
-from django.contrib import auth
 from django.contrib.auth.backends import ModelBackend
-from django.core.exceptions import ObjectDoesNotExist, MultipleObjectsReturned
+from django.contrib.auth.models import User
+from django.core.exceptions import ObjectDoesNotExist, MultipleObjectsReturned,\
+    ImproperlyConfigured
 
 from djangosaml2.signals import pre_user_save
 
-try:
-    from django.contrib.auth.models import SiteProfileNotAvailable
-except ImportError:
-    class SiteProfileNotAvailable(Exception):
-        pass
-
-
 logger = logging.getLogger('djangosaml2')
 
-# Django 1.5 Custom user model
-try:
-    User = auth.get_user_model()
-except AttributeError:
-    User = auth.models.User
 
 class Saml2Backend(ModelBackend):
 
@@ -53,26 +43,16 @@ class Saml2Backend(ModelBackend):
         if not attributes:
             logger.error('The attributes dictionary is empty')
 
-        use_name_id_as_username = getattr(
-            settings, 'SAML_USE_NAME_ID_AS_USERNAME', False)
-
         django_user_main_attribute = getattr(
             settings, 'SAML_DJANGO_USER_MAIN_ATTRIBUTE', 'username')
 
         logger.debug('attributes: %s' % attributes)
+        logger.debug('attribute_mapping: %s' % attribute_mapping)
         saml_user = None
-        if use_name_id_as_username:
-            if 'name_id' in session_info:
-                logger.debug('name_id: %s' % session_info['name_id'])
-                saml_user = session_info['name_id'].text
-            else:
-                logger.error('The nameid is not available. Cannot find user without a nameid.')
-        else:
-            logger.debug('attribute_mapping: %s' % attribute_mapping)
-            for saml_attr, django_fields in attribute_mapping.items():
-                if (django_user_main_attribute in django_fields
-                    and saml_attr in attributes):
-                    saml_user = attributes[saml_attr][0]
+        for saml_attr, django_fields in attribute_mapping.items():
+            if (django_user_main_attribute in django_fields
+                and saml_attr in attributes):
+                saml_user = attributes[saml_attr][0]
 
         if saml_user is None:
             logger.error('Could not find saml_user value')
@@ -159,13 +139,15 @@ class Saml2Backend(ModelBackend):
 
         try:
             profile = user.get_profile()
+        except AttributeError:  # In Django >1.6 get_profile is removed
+            profile = None
         except ObjectDoesNotExist:
             profile = None
-        except SiteProfileNotAvailable:
-            profile = None
-        # Django 1.5 custom model assumed
-        except AttributeError:
-            profile = user
+
+        if profile is None:
+            profile_module = getattr(settings, 'SAML_PROFILE_MODULE', None)
+            if profile_module is not None:
+                profile = self._get_profile(user, profile_module)
 
         user_modified = False
         profile_modified = False
@@ -208,8 +190,8 @@ class Saml2Backend(ModelBackend):
 
         Return True if the attribute was changed and False otherwise.
         """
-        field = obj._meta.get_field_by_name(attr)
-        if len(value) > field[0].max_length:
+        field = obj._meta.get_field(attr)
+        if len(value) > field.max_length:
             cleaned_value = value[:field[0].max_length]
             logger.warn('The attribute "%s" was trimmed from "%s" to "%s"' %
                         (attr, value, cleaned_value))
@@ -222,3 +204,32 @@ class Saml2Backend(ModelBackend):
             return True
 
         return False
+
+    def _get_profile(self, user, profile_module):
+        """
+        Returns site-specific profile for this user. Raises
+        SamlProfileNotAvailable if this site does not allow profiles.
+        """
+        try:
+            app_label, model_name = profile_module.split('.')
+        except ValueError:
+            raise SamlProfileNotAvailable(
+                'app_label and model_name should be separated by a dot in '
+                'the SAML_PROFILE_MODULE setting')
+        try:
+            model = apps.get_model(app_label, model_name)
+            if model is None:
+                raise SamlProfileNotAvailable(
+                    'Unable to load the profile model, check '
+                    'SAML_PROFILE_MODULE in your project settings')
+            try:
+                profile = model.objects.get(user__id__exact=user.id)
+            except ObjectDoesNotExist:
+                return None
+        except (ImportError, ImproperlyConfigured):
+            raise SamlProfileNotAvailable
+        return profile
+
+class SamlProfileNotAvailable(Exception):
+    pass
+
