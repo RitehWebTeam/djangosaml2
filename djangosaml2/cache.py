@@ -14,7 +14,6 @@
 # limitations under the License.
 
 from saml2.cache import Cache
-from saml2.ident import code, decode
 
 
 class DjangoSessionCacheAdapter(dict):
@@ -76,27 +75,12 @@ class IdentityCache(Cache):
         self._db = DjangoSessionCacheAdapter(django_session, '_identities')
         self._sync = True
 
-    def get(self, name_id, entity_id, *args, **kwargs):
-        info = super(IdentityCache, self).get(name_id, entity_id, *args, **kwargs)
-        try:
-            name_id = info['name_id']
-        except KeyError:
-            pass
-        else:
-            info = dict(info)
-            info['name_id'] = decode(name_id)
-
-        return info
-
-    def set(self, name_id, entity_id, info, *args, **kwargs):
-        try:
-            name_id = info['name_id']
-        except KeyError:
-            pass
-        else:
-            info = dict(info)
-            info['name_id'] = code(name_id)
-        return super(IdentityCache, self).set(name_id, entity_id, info, *args, **kwargs)
+    def delete(self, subject_id):
+        super(IdentityCache, self).delete(subject_id)
+        # saml2.Cache doesn't do a sync after a delete
+        # I'll send a patch to fix this in that side, after which this
+        # could be removed
+        self._db.sync()
 
 
 class StateCache(DjangoSessionCacheAdapter):
